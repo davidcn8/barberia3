@@ -158,21 +158,51 @@ a.ghost{display:inline-flex;align-items:center;text-decoration:none;color:var(--
   .cal-title{font-size:24px}
   .cal-day{height:42px}
 }
+
+.dayh{text-transform:none}
+.dayh::first-letter{text-transform:uppercase}
+
+/* ===== Añadidos: cuentas, mis citas, repetición ===== */
+.tabs.three{grid-template-columns:repeat(3,minmax(0,1fr))}
+.acct{margin:14px 0 0;font-size:14px;color:var(--muted);overflow-wrap:anywhere}
+.acct b{color:var(--ink);font-weight:600}
+.linkbtn{border:0;background:none;padding:0;min-height:32px;color:var(--blue);font-weight:600;text-decoration:underline;font-size:inherit;text-align:left}
+.links{display:grid;gap:4px;margin-top:14px;font-size:14px;color:var(--muted)}
+.check{display:flex;align-items:center;gap:10px;font-weight:500;margin:0 0 14px}
+.check input{width:20px;height:20px;flex:none;padding:0;accent-color:var(--red)}
+.err{margin:0 0 12px;color:var(--red);font-size:14px;font-weight:600}
+.chip{display:inline-block;margin-top:4px;padding:2px 10px;border-radius:99px;background:var(--soft);font-size:12px;font-weight:600;color:var(--muted)}
+.chip.ok{color:var(--ok)}
+.chip.warn{color:var(--red)}
+.datelist{list-style:none;margin:0;padding:0;display:grid;gap:8px;font-weight:600;font-variant-numeric:tabular-nums}
+.datelist .more{color:var(--muted);font-weight:400}
+.confirm{display:grid;gap:8px;width:100%}
+.row.past{opacity:.7}
+.who .chip{margin-top:6px}
 </style>
 </head>
 <body>
 <div id="app"></div>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
 <script>
 (function(){
 'use strict';
 /* ========= AJUSTES: lo único que tienes que tocar ========= */
 var CONFIG={
   shop:'Davo Barber',
-  phone:'622337804',        /* tu WhatsApp con 9 cifras, por ejemplo '600123456' */
-  price:3,           /* precio del corte en euros */
-  horizonMonths:6    /* hasta cuántos meses por delante se puede reservar */
+  price:3,             /* precio del corte en euros */
+  horizonMonths:4,     /* mes actual + 4 meses más. Al empezar un mes nuevo se abre uno más. */
+  cancelMinHours:2,    /* hasta cuántas horas antes de la cita se puede cancelar desde la web */
+  firebase:{           /* datos de tu proyecto de Firebase */
+    apiKey:'AIzaSyCtP14tVahMxJJl1hYxdvDFilUBp-pV5oA',
+    authDomain:'barberia-96d24.firebaseapp.com',
+    projectId:'barberia-96d24',
+    appId:'1:866815742824:web:e42d561bc3463ac1c5bcdd'
+  }
 };
-/* Horario por día de la semana (0 = domingo ... 6 = sábado). Cada bloque es [hora de inicio, hora de fin].
+/* Horario por día de la semana (0 = domingo ... 6 = sábado). Cada bloque es [hora inicio, hora fin].
    Lunes (1) y domingo (0) no tienen bloques, así que salen desactivados. */
 var SCHEDULE={
   2:[[16,20]], 3:[[16,20]], 4:[[16,20]], 5:[[16,20]],
@@ -180,7 +210,7 @@ var SCHEDULE={
 };
 /* ========================================================== */
 
-var KEY='davo-barber-agenda-v1', KEYC='davo-barber-cliente-v1';
+var KEYC='davo-barber-cliente-v1';
 var STEP=45;
 var app=document.getElementById('app');
 var DAYS=['domingo','lunes','martes','miércoles','jueves','viernes','sábado'];
@@ -189,6 +219,7 @@ var MS=['ene','feb','mar','abr','may','jun','jul','ago','sep','oct','nov','dic']
 var DOWL=['L','M','X','J','V','S','D'];
 var PRICE=CONFIG.price+' €';
 
+function $(id){return document.getElementById(id)}
 function pad(n){return String(n).padStart(2,'0')}
 function hm(x){return pad(Math.floor(x/60))+':'+pad(x%60)}
 function key(d){return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())}
@@ -200,27 +231,81 @@ function normPhone(s){var d=digits(s);if(d.length===9&&/^[679]/.test(d))d='34'+d
 function longDay(k){var d=parse(k);return DAYS[d.getDay()]+' '+d.getDate()+' de '+MONTHS[d.getMonth()]}
 function shortDay(k){var d=parse(k);return DAYS[d.getDay()].slice(0,3)+' '+d.getDate()+' '+MS[d.getMonth()]}
 function plural(n,a,b){return n+' '+(n===1?a:b)}
+function waLink(phone,msg){return 'https://wa.me/'+phone+'?text='+encodeURIComponent(msg)}
+function loadLocal(k){try{return JSON.parse(localStorage.getItem(k))}catch(e){return null}}
+function saveLocal(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}
+function startOf(b){var d=parse(b.date);d.setHours(Math.floor(b.time/60),b.time%60,0,0);return d}
 
-/* ---------- datos ---------- */
-function load(k){try{return JSON.parse(localStorage.getItem(k))}catch(e){return null}}
-function save(k,v){try{localStorage.setItem(k,JSON.stringify(v));return true}catch(e){return false}}
-var saved=load(KEY);
-var cli=load(KEYC)||{};
-var S={shop:CONFIG.shop||'Davo Barber',phone:normPhone(CONFIG.phone),bookings:Array.isArray(saved)?saved:[]};
-var ui={sel:null,time:null,month:null,name:cli.name||'',phone:cli.phone||'',step:'pick',view:'book',confirm:null,owner:false};
+/* ================= capa de datos (Firebase) ================= */
+function makeDB(){
+  var cfg=CONFIG.firebase, fb=window.firebase;
+  if(!cfg.apiKey||!cfg.projectId)return {error:'config'};
+  if(!fb||!fb.initializeApp)return {error:'sdk'};
+  try{if(!fb.apps.length)fb.initializeApp(cfg)}catch(e){return {error:'sdk'}}
+  var fs=fb.firestore(), auth=fb.auth(), P=fb.auth.Auth.Persistence;
+  var slots=fs.collection('slots'), books=fs.collection('bookings');
+  function id(b){return b.date+'_'+b.time}
+  function plain(u){return u?{uid:u.uid,email:u.email,displayName:u.displayName||''}:null}
+  function list(s){var a=[];s.forEach(function(d){var v=d.data();v.id=d.id;a.push(v)});return a}
+  return {
+    watchSlots:function(from,ok,bad){
+      return slots.where('date','>=',from).onSnapshot(function(s){var o={};s.forEach(function(d){o[d.id]=d.data()});ok(o)},bad);
+    },
+    watchMine:function(uid,ok,bad){return books.where('uid','==',uid).onSnapshot(function(s){ok(list(s))},bad)},
+    watchBookings:function(from,ok,bad){return books.where('date','>=',from).onSnapshot(function(s){ok(list(s))},bad)},
+    book:function(b){
+      var i=id(b), bt=fs.batch();
+      bt.set(slots.doc(i),{date:b.date,time:b.time});
+      var doc={date:b.date,time:b.time,name:b.name,phone:b.phone||'',reminded:false};
+      if(b.uid){doc.uid=b.uid;doc.email=b.email;doc.emailed=false;doc.createdAt=fb.firestore.FieldValue.serverTimestamp()}
+      if(b.series)doc.series=b.series;
+      bt.set(books.doc(i),doc);
+      return bt.commit();
+    },
+    cancelMany:function(ids){
+      var chunks=[];for(var i=0;i<ids.length;i+=8)chunks.push(ids.slice(i,i+8));
+      return chunks.reduce(function(p,c){
+        return p.then(function(){var bt=fs.batch();c.forEach(function(x){bt.delete(slots.doc(x));bt.delete(books.doc(x))});return bt.commit()});
+      },Promise.resolve());
+    },
+    markReminded:function(i){return books.doc(i).update({reminded:true})},
+    block:function(l){var bt=fs.batch();l.forEach(function(b){bt.set(slots.doc(id(b)),{date:b.date,time:b.time,blocked:true})});return bt.commit()},
+    release:function(ids){var bt=fs.batch();ids.forEach(function(i){bt.delete(slots.doc(i))});return bt.commit()},
+    register:function(name,email,pass,remember){
+      return auth.setPersistence(remember?P.LOCAL:P.SESSION)
+        .then(function(){return auth.createUserWithEmailAndPassword(email,pass)})
+        .then(function(c){return c.user.updateProfile({displayName:name})});
+    },
+    login:function(email,pass,remember){
+      return auth.setPersistence(remember?P.LOCAL:P.SESSION).then(function(){return auth.signInWithEmailAndPassword(email,pass)});
+    },
+    reset:function(email){return auth.sendPasswordResetEmail(email)},
+    logout:function(){return auth.signOut()},
+    onAuth:function(cb){return auth.onAuthStateChanged(function(u){cb(plain(u))})}
+  };
+}
+var DB=window.__DAVO_DB__||makeDB();
+
+/* ================= estado ================= */
+var cli=loadLocal(KEYC)||{};
+var S={slots:{},bookings:[],mine:[]};
+var ui={sel:null,time:null,month:null,name:cli.name||'',phone:cli.phone||'',step:'pick',view:'book',
+        owner:false,user:null,isAdmin:null,ready:false,error:null,busy:false,authBusy:false,done:null,selInit:false,
+        cancelFor:null,confirm:null,rep:1,authMode:'login',authBack:'pick',mineReady:false,remember:true};
 function readHash(){ui.owner=location.hash==='#panel';ui.view=ui.owner?'admin':'book'}
 readHash();
+(function(){var n=new Date();ui.month={y:n.getFullYear(),m:n.getMonth()}})();
 
-/* ---------- horario y huecos ---------- */
+/* ================= horario y huecos ================= */
 function blocksOf(d){return SCHEDULE[d.getDay()]||[]}
 function groupsOf(d){
   return blocksOf(d).map(function(b){
-    var slots=[];for(var m=b[0]*60;m+STEP<=b[1]*60;m+=STEP)slots.push(m);
-    return {label:b[0]<14?'Mañana':'Tarde',slots:slots};
+    var s=[];for(var m=b[0]*60;m+STEP<=b[1]*60;m+=STEP)s.push(m);
+    return {label:b[0]<14?'Mañana':'Tarde',slots:s};
   });
 }
 function allSlots(d){var o=[];groupsOf(d).forEach(function(g){o=o.concat(g.slots)});return o}
-function taken(k,t){return S.bookings.some(function(b){return b.date===k&&b.time===t})}
+function taken(k,t){return !!S.slots[k+'_'+t]}
 function freeSlots(d){
   var k=key(d), now=new Date(), tk=key(now), cut=now.getHours()*60+now.getMinutes()+30;
   return allSlots(d).filter(function(t){return !taken(k,t)&&(k>tk||(k===tk&&t>=cut))});
@@ -236,25 +321,96 @@ function openDays(n){
   for(var i=0;i<n;i++){var x=addDays(d,i);if(blocksOf(x).length)o.push(key(x))}
   return o;
 }
-ui.sel=firstFreeDay();
-(function(){var b=ui.sel?parse(ui.sel):new Date();ui.month={y:b.getFullYear(),m:b.getMonth()}})();
-
-/* ---------- mensajes ---------- */
-function requestMsg(){
-  return 'Hola, soy '+ui.name.trim()+'. Quiero reservar un corte de pelo el '+longDay(ui.sel)+' a las '+hm(ui.time)+' ('+STEP+' min, '+PRICE+'). Mi móvil: '+ui.phone.trim()+'. ¡Gracias!';
+function firstSel(){
+  if(ui.selInit)return;
+  ui.selInit=true;
+  ui.sel=firstFreeDay();
+  if(ui.sel){var b=parse(ui.sel);ui.month={y:b.getFullYear(),m:b.getMonth()}}
 }
+
+/* ================= repetir cada semana ================= */
+function plan(){
+  var n=ui.rep, base=parse(ui.sel), end=maxDate(), out=[];
+  for(var i=0;i<60;i++){
+    if(n>0&&i>=n)break;
+    var d=addDays(base,7*i);
+    if(d>end)break;
+    out.push({k:key(d),ok:freeSlots(d).indexOf(ui.time)>=0});
+  }
+  return out;
+}
+
+/* ================= mensajes e ics ================= */
 function firstName(b){return String(b.name||'').trim().split(/\s+/)[0]||''}
 function reminderMsg(b){
   var f=firstName(b);
-  return 'Hola'+(f?' '+f:'')+', te recuerdo que mañana '+longDay(b.date)+' a las '+hm(b.time)+' tienes cita para cortarte el pelo en '+S.shop+' ('+PRICE+'). ¡Hasta mañana!';
+  return 'Hola'+(f?' '+f:'')+', te recuerdo que mañana '+longDay(b.date)+' a las '+hm(b.time)+' tienes cita para cortarte el pelo en '+CONFIG.shop+' ('+PRICE+'). ¡Hasta mañana!';
 }
-function confirmMsg(b){
-  var f=firstName(b);
-  return 'Hola'+(f?' '+f:'')+', tu cita en '+S.shop+' queda confirmada: '+longDay(b.date)+' a las '+hm(b.time)+' ('+STEP+' min, '+PRICE+'). ¡Te espero!';
+function icsFile(list){
+  var stamp=new Date().toISOString().replace(/[-:]/g,'').split('.')[0]+'Z';
+  var lines=['BEGIN:VCALENDAR','VERSION:2.0','PRODID:-//Davo Barber//ES'];
+  list.forEach(function(x){
+    var d=x.k.replace(/-/g,''), s=pad(Math.floor(x.t/60))+pad(x.t%60)+'00', e=x.t+STEP, en=pad(Math.floor(e/60))+pad(e%60)+'00';
+    lines.push('BEGIN:VEVENT','UID:'+x.k+'-'+x.t+'@davobarber','DTSTAMP:'+stamp,'DTSTART:'+d+'T'+s,'DTEND:'+d+'T'+en,
+      'SUMMARY:Corte de pelo en '+CONFIG.shop,'DESCRIPTION:Precio: '+PRICE,'END:VEVENT');
+  });
+  lines.push('END:VCALENDAR');
+  return lines.join('\r\n');
 }
-function waLink(phone,msg){return 'https://wa.me/'+phone+'?text='+encodeURIComponent(msg)}
+function downloadIcs(list){
+  try{
+    var blob=new Blob([icsFile(list)],{type:'text/calendar'}), a=document.createElement('a');
+    a.href=URL.createObjectURL(blob);a.download='citas-davo-barber.ics';
+    document.body.appendChild(a);a.click();document.body.removeChild(a);
+    setTimeout(function(){URL.revokeObjectURL(a.href)},2000);
+  }catch(e){toast('No se pudo crear el archivo del calendario.')}
+}
 
-/* ---------- vista cliente: elegir ---------- */
+/* ================= cuenta ================= */
+function authError(err){
+  var c=err&&err.code||'';
+  if(c==='auth/email-already-in-use')return 'Ya existe una cuenta con ese correo. Prueba a entrar.';
+  if(c==='auth/weak-password')return 'La contraseña debe tener al menos 6 caracteres.';
+  if(c==='auth/invalid-email')return 'Ese correo no parece válido.';
+  if(c==='auth/too-many-requests')return 'Demasiados intentos. Espera unos minutos e inténtalo otra vez.';
+  if(c==='auth/network-request-failed')return 'Sin conexión. Revisa internet e inténtalo otra vez.';
+  if(c==='auth/user-not-found'||c==='auth/wrong-password'||c==='auth/invalid-credential'||c==='auth/invalid-login-credentials')return 'Correo o contraseña incorrectos.';
+  return 'No se pudo completar. Inténtalo otra vez.';
+}
+function authHtml(adminMode){
+  var m=ui.authMode, reg=m==='register', rst=m==='reset';
+  if(adminMode&&reg)m=ui.authMode='login';
+  var title=adminMode?'Acceso del barbero':(rst?'Nueva contraseña':(reg?'Crear cuenta':'Entrar'));
+  var kicker=adminMode?'Acceso privado':'Tu cuenta';
+  var form='<form id="auth-form" class="card" autocomplete="on">'+
+    (reg?'<div class="field"><label for="l-name">Nombre</label><input id="l-name" type="text" autocomplete="name" maxlength="60" required></div>':'')+
+    '<div class="field"><label for="l-email">Correo</label><input id="l-email" type="email" autocomplete="username" maxlength="120" required></div>'+
+    (rst?'':'<div class="field"><label for="l-pass">Contraseña</label><input id="l-pass" type="password" autocomplete="'+(reg?'new-password':'current-password')+'"'+(reg?' minlength="6"':'')+' required>'+(reg?'<p class="note">Mínimo 6 caracteres.</p>':'')+'</div>')+
+    (rst?'':'<label class="check" for="l-rem"><input id="l-rem" type="checkbox"'+(ui.remember?' checked':'')+'> Recordarme en este dispositivo</label>')+
+    '<p class="err" id="auth-err" role="alert" hidden></p>'+
+    '<button type="submit" class="btn block">'+(rst?'Enviarme el correo':(reg?'Crear cuenta':'Entrar'))+'</button></form>';
+  var links='<div class="links">';
+  if(!adminMode&&!reg)links+='<span>¿No tienes cuenta? <button type="button" class="linkbtn" data-act="authmode" data-mode="register">Crear cuenta</button></span>';
+  if(!adminMode&&reg)links+='<span>¿Ya tienes cuenta? <button type="button" class="linkbtn" data-act="authmode" data-mode="login">Entrar</button></span>';
+  if(!rst)links+='<span><button type="button" class="linkbtn" data-act="authmode" data-mode="reset">He olvidado mi contraseña</button></span>';
+  if(rst)links+='<span><button type="button" class="linkbtn" data-act="authmode" data-mode="login">Volver a entrar</button></span>';
+  if(!adminMode)links+='<span><button type="button" class="linkbtn" data-act="authback">Volver</button></span>';
+  links+='</div>';
+  var note=reg?'<p class="note">Uso tu correo solo para tu cuenta y para avisarte 24 horas antes de tu cita.</p>':'';
+  return '<div class="pole"></div><header class="top"><p class="kicker">'+kicker+'</p><h1>'+title+'</h1>'+
+    (rst?'<p class="sub">Te mando un correo con un enlace para elegir una contraseña nueva.</p>':'')+'</header>'+
+    '<div id="z-banner">'+bannerHtml()+'</div>'+form+links+note;
+}
+function setErr(msg){var e=$('auth-err');if(!e)return;e.textContent=msg||'';e.hidden=!msg}
+
+/* ================= vista cliente: reservar ================= */
+function bannerHtml(){
+  var msg='';
+  if(DB.error==='config')msg='Reservas desactivadas: falta conectar la base de datos.';
+  else if(DB.error==='sdk')msg='No se pudo cargar el servicio de reservas. Revisa tu conexión y recarga la página.';
+  else if(ui.error)msg=ui.error;
+  return msg?'<div class="banner">'+esc(msg)+'</div>':'';
+}
 function calHtml(){
   var now=new Date(), tk=key(now), y=ui.month.y, m=ui.month.m;
   var idx=(y-now.getFullYear())*12+(m-now.getMonth());
@@ -267,18 +423,20 @@ function calHtml(){
   for(var i=0;i<off;i++)h+='<span></span>';
   for(var d=1;d<=dim;d++){
     var date=new Date(y,m,d), k=key(date), open=blocksOf(date).length>0, past=k<tk;
-    var ok=open&&!past&&freeSlots(date).length>0;
-    var why=!open?', cerrado':past?', pasado':ok?'':', completo';
+    var ok=ui.ready&&open&&!past&&freeSlots(date).length>0;
+    var why=!open?', cerrado':past?', pasado':ok?'':ui.ready?', completo':', cargando';
     h+='<button type="button" class="cal-day'+(k===tk?' today':'')+(open?'':' closed')+'" data-day="'+k+'" aria-pressed="'+(ui.sel===k)+'" aria-label="'+esc(longDay(k)+why)+'"'+(ok?'':' disabled')+'><b>'+d+'</b></button>';
   }
   return h+'</div><p class="legend"><i class="dot"></i> Hay citas libres <span>·</span> <i class="dot off"></i> Cerrado o completo</p></div>';
 }
 function slotsHtml(){
-  if(!ui.sel)return '<p class="hint">No quedan días libres en los próximos meses.</p>';
+  var head='<h2>2 · Hora'+(ui.sel?'<span>'+esc(longDay(ui.sel))+'</span>':'')+'</h2>';
+  if(!ui.ready)return head+'<p class="hint">'+(ui.error||DB.error?'Ahora mismo no se pueden ver los huecos.':'Cargando huecos…')+'</p>';
+  if(!ui.sel)return head+'<p class="hint">No quedan días libres en los próximos meses.</p>';
   var d=parse(ui.sel), free=freeSlots(d), groups=groupsOf(d);
-  return groups.map(function(g){
-    var head=groups.length>1?'<p class="group">'+g.label+'</p>':'';
-    return head+'<div class="slots">'+g.slots.map(function(t){
+  return head+groups.map(function(g){
+    var gh=groups.length>1?'<p class="group">'+g.label+'</p>':'';
+    return gh+'<div class="slots">'+g.slots.map(function(t){
       var isFree=free.indexOf(t)>=0, on=ui.time===t&&isFree;
       if(!isFree)return '<button type="button" class="slot" disabled><b>'+hm(t)+'</b><small>'+(taken(ui.sel,t)?'Ocupado':'Ya pasó')+'</small></button>';
       return '<button type="button" class="slot" data-time="'+t+'" aria-pressed="'+on+'"><b>'+hm(t)+'</b><small>hasta '+hm(t+STEP)+'</small></button>';
@@ -290,180 +448,337 @@ function hoursHtml(){
   '<li><span>Sábados</span><b>10:00 – 13:00 · 16:00 – 19:00</b></li>'+
   '<li><span>Lunes y domingo</span><b>Cerrado</b></li></ul>';
 }
+function dataHtml(){
+  if(!ui.user){
+    return '<h2>3 · Tu cuenta</h2><div class="card"><p class="empty" style="color:var(--ink);margin-bottom:12px">Para reservar necesitas una cuenta. Así ves y cancelas tus citas y te aviso por correo el día antes.</p>'+
+    '<div class="two"><button type="button" class="btn" data-act="auth" data-mode="register">Crear cuenta</button>'+
+    '<button type="button" class="ghost" style="min-height:52px" data-act="auth" data-mode="login">Ya tengo cuenta</button></div></div>';
+  }
+  return '<h2>3 · Tus datos</h2>'+
+  '<p class="note" style="margin:0 0 12px">Reservando como <b>'+esc(ui.user.email)+'</b></p>'+
+  '<div class="field"><label for="f-name">Nombre</label><input id="f-name" type="text" autocomplete="given-name" maxlength="60" placeholder="Tu nombre" value="'+esc(ui.name)+'"></div>'+
+  '<div class="field"><label for="f-phone">Móvil (opcional)</label><input id="f-phone" type="tel" inputmode="tel" autocomplete="tel" maxlength="20" placeholder="600 123 456" value="'+esc(ui.phone)+'"><p class="note">Te aviso por correo 24 horas antes de la cita.</p></div>';
+}
+function acctRow(){
+  if(ui.user)return '<p class="acct">Sesión: <b>'+esc(ui.user.email)+'</b> · <button type="button" class="linkbtn" data-act="logout">Salir</button></p>';
+  return '<p class="acct">¿Ya tienes cuenta? <button type="button" class="linkbtn" data-act="auth" data-mode="login">Entrar</button></p>';
+}
 function bookHtml(){
-  var banner=(ui.owner&&!S.phone)?'<div class="banner">Falta tu WhatsApp en el archivo. Mientras no esté, los clientes no pueden enviarte la solicitud.</div>':'';
   return ''+
   '<div class="pole"></div>'+
-  '<header class="top"><p class="kicker">Reserva de cita</p><h1>'+esc(S.shop)+'</h1>'+
+  '<header class="top"><p class="kicker">Reserva de cita</p><h1>'+esc(CONFIG.shop)+'</h1>'+
   '<p class="sub"><b>Corte de pelo · '+STEP+' min · <span class="price">'+PRICE+'</span></b></p>'+hoursHtml()+'</header>'+
-  banner+
-  '<h2>1 · Día</h2>'+calHtml()+
-  '<h2>2 · Hora'+(ui.sel?'<span>'+esc(longDay(ui.sel))+'</span>':'')+'</h2>'+slotsHtml()+
-  '<h2>3 · Tus datos</h2>'+
-  '<div class="field"><label for="f-name">Nombre</label><input id="f-name" type="text" autocomplete="given-name" placeholder="Tu nombre" value="'+esc(ui.name)+'"></div>'+
-  '<div class="field"><label for="f-phone">Tu móvil</label><input id="f-phone" type="tel" inputmode="tel" autocomplete="tel" placeholder="600 123 456" value="'+esc(ui.phone)+'"><p class="note">Te recordaré la cita el día antes.</p></div>'+
-  '<p class="note">Aún no es una cita: es una solicitud. Queda confirmada cuando te responda por WhatsApp.</p>';
+  acctRow()+
+  '<div id="z-banner">'+bannerHtml()+'</div>'+
+  '<h2>1 · Día</h2><div id="z-cal">'+calHtml()+'</div>'+
+  '<div id="z-slots">'+slotsHtml()+'</div>'+
+  '<div id="z-data">'+dataHtml()+'</div>';
 }
 function pickBar(){
   return '<div class="cta-bar"><div class="cta-in"><p class="sum" id="cta-sum"></p>'+
-  '<button type="button" id="cta-btn" class="cta" data-act="review" aria-disabled="true">Revisar solicitud</button></div></div>';
+  '<button type="button" id="cta-btn" class="cta" data-act="review" aria-disabled="true">Revisar cita</button></div></div>';
 }
 function ctaInfo(){
-  var nm=ui.name.trim(), ph=digits(ui.phone);
+  if(DB.error)return {ok:false,why:'Reservas no disponibles ahora mismo.'};
+  if(!ui.ready)return {ok:false,why:'Cargando huecos…'};
   if(!ui.sel||ui.time==null)return {ok:false,why:'Elige día y hora.'};
   var sum='<b>'+esc(shortDay(ui.sel))+'</b> · '+hm(ui.time)+'–'+hm(ui.time+STEP)+' · '+PRICE;
+  if(!ui.user)return {ok:true,guest:true,why:sum+' · entra para reservar'};
+  var nm=ui.name.trim(), ph=digits(ui.phone);
   if(nm.length<2)return {ok:false,why:sum+' · falta tu nombre'};
-  if(ph.length<9||ph.length>15)return {ok:false,why:sum+' · revisa tu móvil'};
+  if(ph.length&&(ph.length<9||ph.length>15))return {ok:false,why:sum+' · revisa tu móvil'};
   return {ok:true,why:sum};
 }
 function updateCta(){
-  var s=ctaInfo(), sum=document.getElementById('cta-sum'), b=document.getElementById('cta-btn');
+  var s=ctaInfo(), sum=$('cta-sum'), b=$('cta-btn');
   if(!sum||!b)return;
   sum.innerHTML=s.why;
   b.setAttribute('aria-disabled',s.ok?'false':'true');
+  b.textContent=s.guest?'Entrar para reservar':'Revisar cita';
 }
 
-/* ---------- vista cliente: revisar y enviar ---------- */
+/* ================= vista cliente: revisar y confirmar ================= */
+function repOptions(){
+  var end=maxDate();
+  var opts=[[1,'Solo esta vez'],[4,'Cada semana, 4 semanas'],[8,'Cada semana, 8 semanas'],[12,'Cada semana, 12 semanas'],[0,'Cada semana hasta '+MONTHS[end.getMonth()]]];
+  return opts.map(function(o){return '<option value="'+o[0]+'"'+(ui.rep===o[0]?' selected':'')+'>'+o[1]+'</option>'}).join('');
+}
+function repInner(){
+  if(ui.rep===1)return '';
+  var p=plan(), good=p.filter(function(x){return x.ok}), bad=p.filter(function(x){return !x.ok});
+  var wd=DAYS[parse(ui.sel).getDay()];
+  var h='<p class="note"><b>'+plural(good.length,'cita','citas')+'</b> · todos los '+wd+' a las '+hm(ui.time)+' · '+(good.length*CONFIG.price)+' € en total.</p>';
+  if(bad.length)h+='<p class="note">No están libres y se saltan: '+bad.map(function(x){return esc(shortDay(x.k))}).join(', ')+'.</p>';
+  h+='<p class="note">Puedes cancelar una cita o toda la serie desde Mis citas.</p>';
+  return h;
+}
 function reviewHtml(){
-  var warn=S.phone?'':'<div class="banner">Esta página aún no tiene el WhatsApp del barbero. Copia el mensaje y envíaselo tú.</div>';
   return ''+
   '<div class="pole"></div>'+
-  '<header class="top"><p class="kicker">Último paso</p><h1>Revisa tu cita</h1></header>'+warn+
+  '<header class="top"><p class="kicker">Último paso</p><h1>Revisa tu cita</h1></header>'+
   '<div class="card"><dl class="sumlist">'+
   '<div><dt>Día</dt><dd>'+esc(longDay(ui.sel))+'</dd></div>'+
   '<div><dt>Hora</dt><dd>'+hm(ui.time)+' – '+hm(ui.time+STEP)+'</dd></div>'+
   '<div><dt>Servicio</dt><dd>Corte de pelo · '+STEP+' min</dd></div>'+
   '<div><dt>Nombre</dt><dd>'+esc(ui.name.trim())+'</dd></div>'+
-  '<div><dt>Móvil</dt><dd>'+esc(ui.phone.trim())+'</dd></div>'+
+  '<div><dt>Correo</dt><dd>'+esc(ui.user.email)+'</dd></div>'+
   '<div class="total"><dt>Precio</dt><dd>'+PRICE+'</dd></div></dl></div>'+
-  '<p class="note">Al enviar se abre WhatsApp con el mensaje ya escrito. Solo tienes que pulsar enviar. Pagas el corte en la barbería.</p>'+
+  '<h2>¿Quieres repetirla?</h2>'+
+  '<div class="card"><div class="field" style="margin-bottom:0"><label for="f-rep">Repetición</label><select id="f-rep">'+repOptions()+'</select></div><div id="z-rep">'+repInner()+'</div></div>'+
+  '<p class="note">Al confirmar, el hueco queda reservado para ti y nadie más lo puede coger. Pagas el corte en la barbería. Te mando un correo 24 horas antes de cada cita.</p>'+
   '<div class="stack"><button type="button" class="ghost block" data-act="back">Cambiar día, hora o datos</button></div>';
 }
 function reviewBar(){
-  var btn=S.phone
-    ?'<a id="send-btn" class="cta" target="_blank" rel="noopener" href="'+esc(waLink(S.phone,requestMsg()))+'">Enviar solicitud por WhatsApp</a>'
-    :'<button type="button" class="cta" data-act="copy">Copiar mensaje</button>';
-  return '<div class="cta-bar"><div class="cta-in"><p class="sum"><b>'+esc(shortDay(ui.sel))+'</b> · '+hm(ui.time)+' · '+PRICE+'</p>'+btn+'</div></div>';
+  var n=plan().filter(function(x){return x.ok}).length;
+  return '<div class="cta-bar"><div class="cta-in"><p class="sum"><b>'+esc(shortDay(ui.sel))+'</b> · '+hm(ui.time)+' · '+(n>1?plural(n,'cita','citas')+' · '+(n*CONFIG.price)+' €':PRICE)+'</p>'+
+  '<button type="button" class="cta" data-act="book"'+(ui.busy?' aria-disabled="true"':'')+'>'+(ui.busy?'Reservando…':'Confirmar cita')+'</button></div></div>';
 }
-function sentHtml(){
+function doneHtml(){
+  var d=ui.done, n=d.booked.length;
+  var shown=d.booked.slice(0,6).map(function(k){return '<li>'+esc(longDay(k))+' · '+hm(d.time)+'</li>'}).join('');
+  var more=n>6?'<li class="more">y '+(n-6)+' más</li>':'';
+  var skip=d.skipped.length?'<p class="note">No se pudieron reservar: '+d.skipped.map(function(k){return esc(shortDay(k))}).join(', ')+' (ya estaban ocupados).</p>':'';
   return ''+
   '<div class="pole"></div>'+
-  '<header class="top"><p class="kicker">Solicitud preparada</p><h1>Falta un toque</h1>'+
-  '<p class="sub">En WhatsApp pulsa <b>enviar</b> para que me llegue tu petición para el <b>'+esc(longDay(ui.sel))+'</b> a las <b>'+hm(ui.time)+'</b>. Te confirmo por el mismo chat.</p></header>'+
-  '<div class="stack">'+
-  (S.phone?'<a class="btn" target="_blank" rel="noopener" href="'+esc(waLink(S.phone,requestMsg()))+'">Abrir WhatsApp otra vez</a>':'')+
-  '<button type="button" class="ghost block" data-act="copy">Copiar el mensaje</button>'+
-  '<button type="button" class="ghost block" data-act="again">Pedir otra cita</button></div>'+
-  '<p class="note">Si WhatsApp no se abre, copia el mensaje y envíalo al número del barbero.</p>';
+  '<header class="top"><p class="kicker">'+(n>1?'Citas reservadas':'Cita reservada')+'</p><h1>Te espero</h1>'+
+  '<p class="sub"><b>'+esc(CONFIG.shop)+' · '+STEP+' min · '+PRICE+'</b></p></header>'+
+  '<div class="card"><ul class="datelist">'+shown+more+'</ul></div>'+skip+
+  '<p class="note">Te mando un correo a <b>'+esc(d.email)+'</b> 24 horas antes de cada cita.</p>'+
+  '<div class="stack"><button type="button" class="btn" data-act="ics">Añadir a mi calendario</button>'+
+  '<button type="button" class="ghost block" data-act="gomine">Ver mis citas</button>'+
+  '<button type="button" class="ghost block" data-act="again">Reservar otra cita</button></div>';
 }
 
-/* ---------- panel del barbero ---------- */
-function timeOptions(k){
+/* ================= vista cliente: mis citas ================= */
+function canCancel(b){return startOf(b).getTime()-Date.now()>=CONFIG.cancelMinHours*3600000}
+function mineRow(b,past){
+  var s=b.series?'<span class="chip">Cada '+DAYS[parse(b.date).getDay()]+'</span>':'';
+  var acts='';
+  if(!past){
+    if(ui.cancelFor===b.id){
+      var later=S.mine.filter(function(x){return b.series&&x.series===b.series&&x.date>b.date&&canCancel(x)}).length;
+      acts='<div class="confirm"><p class="note" style="margin:0">¿Seguro que quieres cancelar?</p><div class="acts">'+
+        '<button type="button" class="ghost danger" data-act="cancel-one" data-id="'+esc(b.id)+'">'+(later?'Solo esta':'Sí, cancelar')+'</button>'+
+        (later?'<button type="button" class="ghost danger" data-act="cancel-series" data-id="'+esc(b.id)+'">Esta y las '+later+' siguientes</button>':'')+
+        '<button type="button" class="ghost" data-act="cancel-no">No</button></div></div>';
+    }else if(canCancel(b)){
+      acts='<div class="acts"><button type="button" class="ghost danger" data-act="cancel" data-id="'+esc(b.id)+'">Cancelar</button></div>';
+    }else{
+      acts='<p class="note" style="margin:0">Falta menos de '+CONFIG.cancelMinHours+' h: ya no se puede cancelar desde la web.</p>';
+    }
+  }
+  return '<div class="row'+(past?' past':'')+'"><div class="who"><b>'+hm(b.time)+'</b>'+esc(longDay(b.date))+'<small>'+PRICE+'</small>'+s+'</div>'+acts+'</div>';
+}
+function mineInner(){
+  if(!ui.user){
+    return '<div class="card"><p class="empty" style="color:var(--ink);margin-bottom:12px">Entra en tu cuenta para ver tus citas, cancelarlas o repetirlas.</p>'+
+    '<div class="two"><button type="button" class="btn" data-act="auth" data-mode="login">Entrar</button>'+
+    '<button type="button" class="ghost" style="min-height:52px" data-act="auth" data-mode="register">Crear cuenta</button></div></div>';
+  }
+  if(!ui.mineReady)return '<p class="hint">Cargando tus citas…</p>';
+  var now=Date.now();
+  var up=S.mine.filter(function(b){return startOf(b).getTime()+STEP*60000>now}).sort(function(a,b){return startOf(a)-startOf(b)});
+  var pastL=S.mine.filter(function(b){return startOf(b).getTime()+STEP*60000<=now}).sort(function(a,b){return startOf(b)-startOf(a)}).slice(0,10);
+  var h='<h2>Próximas</h2><div class="card">'+(up.length?up.map(function(b){return mineRow(b,false)}).join(''):'<p class="empty">No tienes citas próximas.</p>')+'</div>';
+  if(pastL.length)h+='<h2>Anteriores</h2><div class="card">'+pastL.map(function(b){return mineRow(b,true)}).join('')+'</div>';
+  return h;
+}
+function mineHtml(){
+  return '<div class="pole"></div><header class="top"><p class="kicker">Tu cuenta</p><h1>Mis citas</h1></header>'+
+    acctRow()+'<div id="z-banner">'+bannerHtml()+'</div><div id="z-mine">'+mineInner()+'</div>'+
+    '<div class="stack"><button type="button" class="btn" data-act="gobook">Reservar una cita</button></div>';
+}
+
+/* ================= panel del barbero ================= */
+function timeOptions(k,withAll){
   var first=true;
-  return allSlots(parse(k)).map(function(t){
-    var tk=taken(k,t), sel=(!tk&&first)?(first=false,' selected'):'';
+  var o=withAll?'<option value="all">Todo el día</option>':'';
+  return o+allSlots(parse(k)).map(function(t){
+    var tk=taken(k,t), sel=(!withAll&&!tk&&first)?(first=false,' selected'):'';
     return '<option value="'+t+'"'+(tk?' disabled':'')+sel+'>'+hm(t)+'–'+hm(t+STEP)+(tk?' (ocupado)':'')+'</option>';
   }).join('');
 }
-function adminHtml(){
+function byTime(a,b){return a.date<b.date?-1:a.date>b.date?1:a.time-b.time}
+function adminTop(){
   var tk=key(new Date()), tm=key(addDays(new Date(),1));
-  var byTime=function(a,b){return a.date<b.date?-1:a.date>b.date?1:a.time-b.time};
   var today=S.bookings.filter(function(b){return b.date===tk}).sort(byTime);
   var tomorrow=S.bookings.filter(function(b){return b.date===tm}).sort(byTime);
-  var upcoming=S.bookings.filter(function(b){return b.date>=tk}).sort(byTime);
-
   var todayRows=today.length?today.map(function(b){
-    return '<div class="row"><div class="who"><b>'+hm(b.time)+'</b>'+esc(b.name)+'<small>'+esc(b.phone||'Sin móvil')+'</small></div></div>';
-  }).join(''):'<p class="empty">Hoy no tienes citas apuntadas.</p>';
-
+    return '<div class="row"><div class="who"><b>'+hm(b.time)+'</b>'+esc(b.name)+'<small>'+esc(b.phone||b.email||'Sin contacto')+'</small></div></div>';
+  }).join(''):'<p class="empty">Hoy no tienes citas.</p>';
+  var money=today.length?'<span>'+plural(today.length,'cita','citas')+' · '+(today.length*CONFIG.price)+' €</span>':'';
   var rem=tomorrow.length?tomorrow.map(function(b){
     var p=normPhone(b.phone);
-    var link=p?'<a class="btn sm" target="_blank" rel="noopener" href="'+esc(waLink(p,reminderMsg(b)))+'">Recordar</a>':'<span class="note">Sin móvil</span>';
-    return '<div class="row"><div class="who"><b>'+hm(b.time)+'</b>'+esc(b.name)+'</div><div class="acts">'+link+
-      '<button type="button" class="ghost" data-act="done" data-id="'+esc(b.id)+'"'+(b.reminded?' disabled':'')+'>'+(b.reminded?'Enviado':'Marcar enviado')+'</button></div></div>';
+    var tag=b.email?(b.emailed?'<span class="chip ok">Correo enviado</span>':'<span class="chip">Correo automático</span>'):'<span class="chip warn">Sin correo</span>';
+    var link=p?'<a class="btn sm" target="_blank" rel="noopener" href="'+esc(waLink(p,reminderMsg(b)))+'">WhatsApp</a>':'';
+    return '<div class="row"><div class="who"><b>'+hm(b.time)+'</b>'+esc(b.name)+'<small>'+esc(b.email||b.phone||'')+'</small>'+tag+'</div>'+(link?'<div class="acts">'+link+'</div>':'')+'</div>';
   }).join(''):'<p class="empty">Mañana ('+esc(longDay(tm))+') no tienes citas.</p>';
-
+  return '<h2>Hoy'+money+'</h2><div class="card">'+todayRows+'</div>'+
+    '<h2>Mañana</h2><div class="card">'+rem+'</div>'+
+    '<p class="note">Los clientes con cuenta reciben un correo automático 24 horas antes. Para los que no tienen correo (citas que apuntas tú), usa el botón de WhatsApp.</p>';
+}
+function adminForms(){
+  var days=openDays(90);
+  var dateOpts=days.map(function(k){return '<option value="'+k+'">'+esc(shortDay(k))+'</option>'}).join('');
+  return ''+
+  '<h2>Apuntar una cita</h2>'+
+  '<div class="card"><p class="note" style="margin:0 0 12px">Para clientes que te piden la cita en persona o por teléfono.</p>'+
+  '<div class="two"><div class="field"><label for="a-date">Día</label><select id="a-date">'+dateOpts+'</select></div>'+
+  '<div class="field"><label for="a-time">Hora</label><select id="a-time">'+(days.length?timeOptions(days[0],false):'')+'</select></div></div>'+
+  '<div class="field"><label for="a-name">Nombre</label><input id="a-name" type="text" maxlength="60" placeholder="Nombre del cliente"></div>'+
+  '<div class="field"><label for="a-phone">Móvil</label><input id="a-phone" type="tel" inputmode="tel" maxlength="20" placeholder="600 123 456"></div>'+
+  '<button type="button" class="btn block" data-act="add">Apuntar cita</button></div>'+
+  '<h2>Bloquear huecos</h2>'+
+  '<div class="card"><p class="note" style="margin:0 0 12px">Para vacaciones o días que no puedes. Los clientes ya no pueden reservar esos huecos.</p>'+
+  '<div class="two"><div class="field"><label for="b-date">Día</label><select id="b-date">'+dateOpts+'</select></div>'+
+  '<div class="field"><label for="b-time">Hora</label><select id="b-time">'+(days.length?timeOptions(days[0],true):'')+'</select></div></div>'+
+  '<button type="button" class="btn block" data-act="block">Bloquear</button></div>';
+}
+function adminLists(){
+  var tk=key(new Date());
+  var upcoming=S.bookings.filter(function(b){return b.date>=tk}).sort(byTime);
   var list='';
-  if(!upcoming.length){list='<p class="empty">Todavía no hay citas apuntadas.</p>'}
+  if(!upcoming.length)list='<p class="empty">Todavía no hay citas reservadas.</p>';
   else{
     var last='';
     upcoming.forEach(function(b){
       if(b.date!==last){list+='<p class="dayh">'+esc(longDay(b.date))+'</p>';last=b.date}
-      var ask=ui.confirm===b.id, p=normPhone(b.phone);
-      var conf=p?'<a class="ghost" target="_blank" rel="noopener" href="'+esc(waLink(p,confirmMsg(b)))+'">Confirmar</a>':'';
-      list+='<div class="row"><div class="who"><b>'+hm(b.time)+'</b>'+esc(b.name)+'<small>'+esc(b.phone||'Sin móvil')+'</small></div>'+
-        '<div class="acts">'+conf+'<button type="button" class="ghost danger" data-act="'+(ask?'cancel-yes':'cancel')+'" data-id="'+esc(b.id)+'">'+(ask?'¿Seguro? Cancelar':'Cancelar')+'</button></div></div>';
+      var ask=ui.confirm===b.id;
+      list+='<div class="row"><div class="who"><b>'+hm(b.time)+'</b>'+esc(b.name)+'<small>'+esc([b.email,b.phone].filter(Boolean).join(' · ')||'Sin contacto')+'</small>'+(b.series?'<span class="chip">Semanal</span>':'')+'</div>'+
+        '<div class="acts"><button type="button" class="ghost danger" data-act="'+(ask?'acancel-yes':'acancel')+'" data-id="'+esc(b.id)+'">'+(ask?'¿Seguro? Cancelar':'Cancelar')+'</button></div></div>';
     });
   }
-  var days=openDays(60);
-  var dateOpts=days.map(function(k){return '<option value="'+k+'">'+esc(shortDay(k))+'</option>'}).join('');
-  var banner=!S.phone?'<div class="banner">Falta tu WhatsApp en el archivo. Mientras no esté, los clientes no pueden enviarte la solicitud.</div>':'';
-  var money=today.length?'<span>'+plural(today.length,'cita','citas')+' · '+(today.length*CONFIG.price)+' €</span>':'';
-
+  var bl={};
+  Object.keys(S.slots).forEach(function(i){var s=S.slots[i];if(s.blocked&&s.date>=tk)(bl[s.date]=bl[s.date]||[]).push(s.time)});
+  var days=Object.keys(bl).sort();
+  var blocked=days.length?days.map(function(d){
+    var ts=bl[d].sort(function(a,b){return a-b});
+    return '<div class="row"><div class="who"><b>'+esc(shortDay(d))+'</b>'+ts.map(hm).join(' · ')+'</div>'+
+      '<div class="acts"><button type="button" class="ghost" data-act="release" data-id="'+d+'">Liberar</button></div></div>';
+  }).join(''):'<p class="empty">No hay huecos bloqueados.</p>';
+  return '<h2>Próximas citas</h2><div class="card">'+list+'</div>'+
+    '<h2>Huecos bloqueados</h2><div class="card">'+blocked+'</div>';
+}
+function adminHtml(){
   return ''+
   '<div class="pole"></div>'+
-  '<header class="top"><p class="kicker">Panel del barbero</p><h1>'+esc(S.shop)+'</h1></header>'+banner+
-  '<h2>Hoy'+money+'</h2><div class="card">'+todayRows+'</div>'+
-  '<h2>Recordatorios de mañana</h2><div class="card">'+rem+'</div>'+
-  '<p class="note">Cada tarde toca Recordar en cada cita. WhatsApp se abre con el mensaje escrito.</p>'+
-  '<h2>Apuntar una cita</h2>'+
-  '<div class="card"><p class="note" style="margin:0 0 12px">Cuando alguien te pida una cita por WhatsApp, apúntala aquí y usa Confirmar para avisarle.</p>'+
-  '<div class="two"><div class="field"><label for="a-date">Día</label><select id="a-date">'+dateOpts+'</select></div>'+
-  '<div class="field"><label for="a-time">Hora</label><select id="a-time">'+(days.length?timeOptions(days[0]):'')+'</select></div></div>'+
-  '<div class="field"><label for="a-name">Nombre</label><input id="a-name" type="text" placeholder="Nombre del cliente"></div>'+
-  '<div class="field"><label for="a-phone">Móvil</label><input id="a-phone" type="tel" inputmode="tel" placeholder="600 123 456"></div>'+
-  '<button type="button" class="btn block" data-act="add">Apuntar cita</button></div>'+
-  '<h2>Próximas citas</h2><div class="card">'+list+'</div>'+
-  '<p class="note">Tu agenda se guarda solo en este móvil y este navegador. Si borras los datos del navegador, se pierde.</p>';
+  '<header class="top"><p class="kicker">Panel del barbero</p><h1>'+esc(CONFIG.shop)+'</h1></header>'+
+  '<div id="z-banner">'+bannerHtml()+'</div>'+
+  '<div id="z-a">'+adminTop()+'</div>'+
+  adminForms()+
+  '<div id="z-b">'+adminLists()+'</div>'+
+  '<div class="stack"><button type="button" class="ghost block" data-act="logout">Cerrar sesión</button></div>';
+}
+function adminScreen(){
+  if(!ui.user)return authHtml(true);
+  if(ui.isAdmin===null)return '<div class="pole"></div><header class="top"><p class="kicker">Panel del barbero</p><h1>Comprobando…</h1></header><p class="hint">Comprobando que esta cuenta es la del barbero.</p>';
+  if(ui.isAdmin===false)return '<div class="pole"></div><header class="top"><p class="kicker">Panel del barbero</p><h1>Sin acceso</h1></header>'+
+    '<div class="card"><p class="empty" style="color:var(--ink)">La cuenta <b>'+esc(ui.user.email)+'</b> no es la del barbero.</p></div>'+
+    '<div class="stack"><button type="button" class="btn" data-act="gobook">Ir a reservar</button><button type="button" class="ghost block" data-act="logout">Cerrar sesión</button></div>';
+  return adminHtml();
 }
 
-/* ---------- pintar ---------- */
+/* ================= pintar ================= */
 function tabs(){
-  return '<div class="tabs" role="group" aria-label="Vista">'+
-  '<button type="button" data-view="book" aria-pressed="'+(ui.view!=='admin')+'">Ver reservas</button>'+
-  '<button type="button" data-view="admin" aria-pressed="'+(ui.view==='admin')+'">Panel</button></div>';
+  var adm=ui.owner&&ui.isAdmin===true;
+  return '<div class="tabs'+(adm?' three':'')+'" role="group" aria-label="Vista">'+
+  '<button type="button" data-view="book" aria-pressed="'+(ui.view==='book')+'">Reservar</button>'+
+  '<button type="button" data-view="mine" aria-pressed="'+(ui.view==='mine')+'">Mis citas</button>'+
+  (adm?'<button type="button" data-view="admin" aria-pressed="'+(ui.view==='admin')+'">Panel</button>':'')+'</div>';
 }
 function render(){
-  var y=window.scrollY, admin=ui.owner&&ui.view==='admin', body, bar='';
-  if(admin)body=adminHtml();
-  else if(ui.step==='review'){body=reviewHtml();bar=reviewBar()}
-  else if(ui.step==='sent'){body=sentHtml()}
-  else{body=bookHtml();bar=pickBar()}
-  app.innerHTML='<div class="wrap">'+(ui.owner?tabs():'')+body+'</div>'+bar+'<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>';
-  if(!admin&&ui.step==='pick')updateCta();
+  var y=window.scrollY, adminV=ui.owner&&ui.view==='admin', body, bar='', showTabs=false;
+  if(adminV){body=adminScreen();showTabs=!!ui.user&&ui.isAdmin===true}
+  else if(ui.step==='auth'){body=authHtml(false)}
+  else if(ui.view==='mine'){body=mineHtml();showTabs=true}
+  else if(ui.step==='review'&&ui.user){body=reviewHtml();bar=reviewBar()}
+  else if(ui.step==='done'&&ui.done){body=doneHtml()}
+  else{ui.step='pick';body=bookHtml();bar=pickBar();showTabs=true}
+  app.innerHTML='<div class="wrap">'+(showTabs?tabs():'')+body+'</div>'+bar+'<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>';
+  if(!adminV&&ui.step==='pick'&&ui.view==='book')updateCta();
   window.scrollTo(0,y);
+}
+function refreshData(){
+  var z;
+  if(ui.owner&&ui.view==='admin'){
+    if(ui.user&&ui.isAdmin===true){
+      if((z=$('z-banner')))z.innerHTML=bannerHtml();
+      if((z=$('z-a')))z.innerHTML=adminTop();
+      if((z=$('z-b')))z.innerHTML=adminLists();
+    }
+    return;
+  }
+  if(ui.step==='auth')return;
+  if(ui.view==='mine'){
+    if((z=$('z-banner')))z.innerHTML=bannerHtml();
+    if((z=$('z-mine')))z.innerHTML=mineInner();
+    return;
+  }
+  if(ui.step==='pick'){
+    if((z=$('z-banner')))z.innerHTML=bannerHtml();
+    if((z=$('z-cal')))z.innerHTML=calHtml();
+    if((z=$('z-slots')))z.innerHTML=slotsHtml();
+    updateCta();
+  }else if(ui.step==='review'){
+    if((z=$('z-rep')))z.innerHTML=repInner();
+  }
 }
 var tt;
 function toast(msg){
-  var t=document.getElementById('toast'); if(!t)return;
-  t.textContent=msg; t.hidden=false; clearTimeout(tt); tt=setTimeout(function(){t.hidden=true},3600);
-}
-function commit(mutator,msg){
-  mutator();
-  var cutoff=key(addDays(new Date(),-2));
-  S.bookings=S.bookings.filter(function(b){return b.date>=cutoff});
-  var ok=save(KEY,S.bookings);
-  render();
-  toast(ok?msg:'Este navegador no deja guardar la agenda. Sal del modo privado.');
-}
-function fallbackCopy(txt){
-  var ta=document.createElement('textarea');ta.value=txt;ta.style.position='fixed';ta.style.opacity='0';
-  document.body.appendChild(ta);ta.select();
-  try{document.execCommand('copy');toast('Mensaje copiado.')}catch(e){toast('No se pudo copiar.')}
-  document.body.removeChild(ta);
-}
-function copyText(txt){
-  if(navigator.clipboard&&navigator.clipboard.writeText){
-    navigator.clipboard.writeText(txt).then(function(){toast('Mensaje copiado.')},function(){fallbackCopy(txt)});
-  }else fallbackCopy(txt);
+  var t=$('toast'); if(!t)return;
+  t.textContent=msg; t.hidden=false; clearTimeout(tt); tt=setTimeout(function(){t.hidden=true},4000);
 }
 function go(step){ui.step=step;render();window.scrollTo(0,0)}
+function openAuth(mode,back){ui.authMode=mode||'login';ui.authBack=back||'pick';go('auth')}
 
-/* ---------- eventos ---------- */
+/* ================= conexión con la base de datos ================= */
+var unsubBookings=null, unsubMine=null;
+function stopBookings(){if(typeof unsubBookings==='function')unsubBookings();unsubBookings=null;S.bookings=[]}
+function startBookings(){
+  stopBookings();
+  unsubBookings=DB.watchBookings(key(new Date()),function(a){
+    var first=ui.isAdmin!==true;
+    S.bookings=a;ui.isAdmin=true;
+    if(first)render();else refreshData();
+  },function(){
+    if(!ui.user)return;
+    ui.isAdmin=false;render();
+  });
+}
+function stopMine(){if(typeof unsubMine==='function')unsubMine();unsubMine=null;S.mine=[];ui.mineReady=false}
+function startMine(uid){
+  stopMine();
+  unsubMine=DB.watchMine(uid,function(a){S.mine=a;ui.mineReady=true;refreshData()},function(){ui.error='No se pudieron cargar tus citas. Revisa tu conexión.';refreshData()});
+}
+if(!DB.error){
+  DB.watchSlots(key(new Date()),function(o){
+    S.slots=o;ui.ready=true;ui.error=null;firstSel();
+    if(ui.time!=null&&ui.sel&&freeSlots(parse(ui.sel)).indexOf(ui.time)<0)ui.time=null;
+    refreshData();
+  },function(){ui.error='No se pudieron cargar los huecos. Revisa tu conexión.';refreshData()});
+  DB.onAuth(function(u){
+    ui.user=u||null;ui.isAdmin=null;
+    stopBookings();stopMine();
+    if(u){
+      startMine(u.uid);
+      if(ui.owner)startBookings();
+      if(!ui.name&&u.displayName)ui.name=u.displayName;
+      if(ui.step==='auth'){ui.step='pick';ui.view=ui.authBack==='mine'?'mine':'book'}
+    }
+    render();
+  });
+}
+
+function run(promise,okMsg,errMsg){
+  toast('Guardando…');
+  return promise.then(function(){toast(okMsg);return true},function(){toast(errMsg||'No se pudo guardar. Inténtalo otra vez.');return false});
+}
+function newSeries(){return 's'+Date.now().toString(36)+Math.random().toString(36).slice(2,6)}
+
+/* ================= eventos ================= */
 app.addEventListener('click',function(e){
-  var t=e.target.closest('[data-day],[data-time],[data-nav],[data-view],[data-act],#send-btn');
+  var t=e.target.closest('[data-day],[data-time],[data-nav],[data-view],[data-act]');
   if(!t)return;
-  if(t.id==='send-btn'){setTimeout(function(){go('sent')},500);return}
   if(t.dataset.day){
     ui.sel=t.dataset.day;
     if(ui.time!=null&&freeSlots(parse(ui.sel)).indexOf(ui.time)<0)ui.time=null;
@@ -474,40 +789,125 @@ app.addEventListener('click',function(e){
     var n=new Date(ui.month.y,ui.month.m+Number(t.dataset.nav),1);
     ui.month={y:n.getFullYear(),m:n.getMonth()};render();return;
   }
-  if(t.dataset.view){ui.view=t.dataset.view;ui.confirm=null;render();window.scrollTo(0,0);return}
+  if(t.dataset.view){ui.view=t.dataset.view;ui.step='pick';ui.cancelFor=null;ui.confirm=null;render();window.scrollTo(0,0);return}
   var act=t.dataset.act, id=t.dataset.id;
   if(act==='review'){
-    if(t.getAttribute('aria-disabled')==='true'){
-      var s=ctaInfo();toast(s.why.replace(/<[^>]+>/g,''));return;
-    }
-    save(KEYC,{name:ui.name.trim(),phone:ui.phone.trim()});
-    go('review');return;
+    if(t.getAttribute('aria-disabled')==='true'){toast(ctaInfo().why.replace(/<[^>]+>/g,''));return}
+    if(!ui.user){openAuth('login','pick');return}
+    saveLocal(KEYC,{name:ui.name.trim(),phone:ui.phone.trim()});
+    ui.rep=1;go('review');return;
   }
   if(act==='back'){go('pick');return}
-  if(act==='again'){ui.time=null;go('pick');return}
-  if(act==='copy'){copyText(requestMsg());return}
+  if(act==='again'){ui.time=null;ui.done=null;ui.view='book';go('pick');return}
+  if(act==='gobook'){if(ui.owner){location.hash=''}ui.view='book';ui.step='pick';render();window.scrollTo(0,0);return}
+  if(act==='gomine'){ui.view='mine';ui.step='pick';render();window.scrollTo(0,0);return}
+  if(act==='ics'){if(ui.done)downloadIcs(ui.done.booked.map(function(k){return {k:k,t:ui.done.time}}));return}
+  if(act==='auth'){openAuth(t.dataset.mode,ui.view==='mine'?'mine':'pick');return}
+  if(act==='authmode'){ui.authMode=t.dataset.mode;render();return}
+  if(act==='authback'){ui.step='pick';ui.view=ui.authBack==='mine'?'mine':'book';render();return}
+  if(act==='logout'){DB.logout().then(function(){ui.step='pick';ui.view=ui.owner?'admin':'book';render()});return}
+  if(act==='book'){
+    if(ui.busy||!ui.user)return;
+    var p=plan().filter(function(x){return x.ok}), series=p.length>1?newSeries():null, time=ui.time;
+    var skipped=plan().filter(function(x){return !x.ok}).map(function(x){return x.k});
+    var booked=[];
+    ui.busy=true;render();
+    p.reduce(function(chain,x){
+      return chain.then(function(){
+        return DB.book({date:x.k,time:time,name:ui.name.trim(),phone:ui.phone.trim(),email:ui.user.email,uid:ui.user.uid,series:series})
+          .then(function(){booked.push(x.k)},function(){skipped.push(x.k)});
+      });
+    },Promise.resolve()).then(function(){
+      ui.busy=false;
+      if(!booked.length){
+        ui.step='pick';render();window.scrollTo(0,0);
+        toast('Ese hueco acaba de ser reservado por otra persona o no hay conexión. Elige otro.');
+        return;
+      }
+      ui.done={booked:booked,skipped:skipped.sort(),time:time,email:ui.user.email};
+      ui.time=null;go('done');
+    });
+    return;
+  }
+  if(act==='cancel'){ui.cancelFor=id;refreshData();return}
+  if(act==='cancel-no'){ui.cancelFor=null;refreshData();return}
+  if(act==='cancel-one'){ui.cancelFor=null;run(DB.cancelMany([id]),'Cita cancelada.');refreshData();return}
+  if(act==='cancel-series'){
+    var b0=S.mine.filter(function(x){return x.id===id})[0];
+    if(!b0)return;
+    var ids=S.mine.filter(function(x){return x.series&&x.series===b0.series&&x.date>=b0.date&&canCancel(x)}).map(function(x){return x.id});
+    ui.cancelFor=null;run(DB.cancelMany(ids),plural(ids.length,'cita cancelada.','citas canceladas.'));refreshData();return;
+  }
   if(act==='add'){
-    var date=document.getElementById('a-date').value, time=Number(document.getElementById('a-time').value);
-    var name=document.getElementById('a-name').value.trim(), phone=document.getElementById('a-phone').value.trim();
+    var date=$('a-date').value, tm=Number($('a-time').value);
+    var name=$('a-name').value.trim(), phone=$('a-phone').value.trim();
     if(name.length<2){toast('Escribe el nombre del cliente.');return}
-    if(!date||isNaN(time)){toast('Elige día y hora.');return}
-    if(taken(date,time)){toast('Ese hueco ya está ocupado.');return}
-    commit(function(){S.bookings.push({id:Date.now().toString(36),date:date,time:time,name:name,phone:phone,reminded:false})},'Cita apuntada.');
-  }else if(act==='cancel'){ui.confirm=id;render()}
-  else if(act==='cancel-yes'){ui.confirm=null;commit(function(){S.bookings=S.bookings.filter(function(b){return b.id!==id})},'Cita cancelada.')}
-  else if(act==='done'){commit(function(){S.bookings.forEach(function(b){if(b.id===id)b.reminded=true})},'Marcado como enviado.')}
+    if(!date||isNaN(tm)){toast('Elige día y hora.');return}
+    if(taken(date,tm)){toast('Ese hueco ya está ocupado.');return}
+    run(DB.book({date:date,time:tm,name:name,phone:phone}),'Cita apuntada.').then(function(ok){
+      if(ok){$('a-name').value='';$('a-phone').value='';$('a-time').innerHTML=timeOptions(date,false)}
+    });
+    return;
+  }
+  if(act==='block'){
+    var bd=$('b-date').value, bt=$('b-time').value, list=[];
+    if(bt==='all')allSlots(parse(bd)).forEach(function(x){if(!taken(bd,x))list.push({date:bd,time:x})});
+    else if(!taken(bd,Number(bt)))list.push({date:bd,time:Number(bt)});
+    if(!list.length){toast('Ya no queda nada libre que bloquear en ese día.');return}
+    run(DB.block(list),plural(list.length,'hueco bloqueado.','huecos bloqueados.'));
+    return;
+  }
+  if(act==='release'){
+    var rids=Object.keys(S.slots).filter(function(i){return S.slots[i].blocked&&S.slots[i].date===id});
+    run(DB.release(rids),'Huecos liberados.');return;
+  }
+  if(act==='acancel'){ui.confirm=id;refreshData();return}
+  if(act==='acancel-yes'){ui.confirm=null;run(DB.cancelMany([id]),'Cita cancelada.');return}
 });
 app.addEventListener('input',function(e){
   if(e.target.id==='f-name'){ui.name=e.target.value;updateCta()}
   else if(e.target.id==='f-phone'){ui.phone=e.target.value;updateCta()}
 });
 app.addEventListener('change',function(e){
-  if(e.target.id==='a-date'){
-    var tsel=document.getElementById('a-time');
-    if(tsel)tsel.innerHTML=timeOptions(e.target.value);
+  if(e.target.id==='a-date'&&$('a-time'))$('a-time').innerHTML=timeOptions(e.target.value,false);
+  if(e.target.id==='b-date'&&$('b-time'))$('b-time').innerHTML=timeOptions(e.target.value,true);
+  if(e.target.id==='f-rep'){
+    ui.rep=Number(e.target.value);
+    var z=$('z-rep');if(z)z.innerHTML=repInner();
+    var bar=document.querySelector('.cta-bar');if(bar)bar.outerHTML=reviewBar();
   }
 });
-window.addEventListener('hashchange',function(){readHash();render()});
+app.addEventListener('submit',function(e){
+  if(e.target.id!=='auth-form')return;
+  e.preventDefault();
+  if(ui.authBusy)return;
+  var mode=ui.authMode, em=$('l-email').value.trim();
+  var pw=$('l-pass')?$('l-pass').value:'', nm=$('l-name')?$('l-name').value.trim():'';
+  var rem=$('l-rem')?$('l-rem').checked:ui.remember;
+  ui.remember=rem;setErr('');
+  if(!em){setErr('Escribe tu correo.');return}
+  ui.authBusy=true;
+  var fail=function(err){ui.authBusy=false;setErr(authError(err))};
+  if(mode==='reset'){
+    DB.reset(em).then(function(){ui.authBusy=false;ui.authMode='login';render();toast('Te he mandado un correo para cambiar la contraseña.')},fail);
+  }else if(mode==='register'){
+    if(nm.length<2){ui.authBusy=false;setErr('Escribe tu nombre.');return}
+    if(pw.length<6){ui.authBusy=false;setErr('La contraseña debe tener al menos 6 caracteres.');return}
+    DB.register(nm,em,pw,rem).then(function(){
+      ui.authBusy=false;
+      if(ui.user)ui.user.displayName=nm;
+      if(!ui.name)ui.name=nm;
+      render();
+    },fail);
+  }else{
+    DB.login(em,pw,rem).then(function(){ui.authBusy=false},fail);
+  }
+});
+window.addEventListener('hashchange',function(){
+  readHash();
+  if(ui.user&&ui.owner&&ui.isAdmin===null&&!unsubBookings)startBookings();
+  render();
+});
 
 render();
 })();
